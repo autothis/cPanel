@@ -41,6 +41,9 @@ Description:
         - Authenticated File transfer Support: FTP etc...
         - Retention only mode:  If you change the retention to a lower number, the script can be run to clean up files without running backups.
         - Split functions into separate file to make main code easier to read.
+        - Backup Processing:
+            simultaneous: Script will start on the next cpanel backup, while the previous is still being uploaded.
+            sequential: There is not enough disk space to hold all the backups locally, so backup and then transfer will need to complete, before the next cpanel account backup can start.
 
 Author: Perrynaise
 Date: 2025-01-08 (Jan 8th 2025)
@@ -55,17 +58,24 @@ import argparse
 import json
 import shutil
 
+# Import Functions from 'functions.py'
+import functions
+
+####################################################################################################################################################
+################################################# Process Parsed Arguments and Initalize Variables #################################################
+####################################################################################################################################################
+
 # Manually Defined Variables - These will be individually overriden if matching argument is passed from commandline.
 #cpanel_backup_accounts = ["Michael", "Josh"]                           # One or more cPanel Accounts to be backedup. CASE SENSITIVE!  Can specify 'all' to backup all accounts.
 cpanel_backup_accounts = ["all"]                           # One or more cPanel Accounts to be backedup. CASE SENSITIVE!  Can specify 'all' to backup all accounts.
-#cpanel_backup_working_directory = "/tmp"                               # This is where the script will store the tar.gz as it is created, and will be kept until a verified transfer to the backup location is completed.  Defaults to /home if not specified.
+cpanel_backup_working_directory = "/home"                               # This is where the script will store the tar.gz as it is created, and will be kept until a verified transfer to the backup location is completed.  Defaults to /home if not specified.
 #cpanel_backup_retention = "7"                                          # This is the number of backups to be kept - it is NOT days or weeks.
 #cpanel_backup_email = "cpaneladmin@example.com"                        # Email address to receive notifications.
 #cpanel_backup_smtp_server = "smtp@example.com"                         # SMTP server responsible for sending notifications.
 #cpanel_backup_smtp_user = "smtpusername"                               # SMTP server authentication username.
 #cpanel_backup_smtp_password = "smtppassw0rd"                           # SMTP server authentication password.
 #cpanel_backup_destination = "/dedicated_backup_drive/cpanel_backups"   # Destination for cPanel backup files.
-cpanel_backup_destination = "/home"   # Destination for cPanel backup files.
+#cpanel_backup_destination = "/home"   # Destination for cPanel backup files.
 #cpanel_backup_exclude_accounts = "randy_randleman"                     # List of accounts to exclude, when using all option.
 
 # Variables to keep track of - List of variables used in this script, and what they are used for.
@@ -104,157 +114,81 @@ for argument_mapping, variable_name in argument_mappings.items():
     if getattr(args, argument_mapping) is not None:
         globals()[variable_name] = getattr(args, argument_name)
 
-# Retreive a Account information from WHM API
-def cpanel_list_all_accounts():
-    try:
-        # Retreive Account Information using 'whmapi1' command
-        result = subprocess.run(
-            args = ["/usr/local/cpanel/bin/whmapi1", "--output=json", "listaccts"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
-        )
-        
-        # Create JSON formatted response variable
-        response = json.loads(result.stdout)
-        
-        # If whmapi1 response "result" is 0 raise error
-        if response["metadata"]["result"] ==0:
-            raise ValueError("whmapi1 query failed", response["metadata"]["reason"])
-            # response["metadata"]["result"] alue of 0 is a failure, 1 is a success
-        return response
-    except Exception as e:
-        # Handle unexpected exceptions
-        print(f"An unexpected error occurred: {e}")
-        return None
+####################################################################################################################################################
+####################################################### Get Filtered List of cPanel Accounts #######################################################
+####################################################################################################################################################
 
-# Convert Values formatted '^\d+[A-Z]$' to Megabytes
-def convert_to_mb(value):
-    if value.endswith("K"):
-        # Convert KB to MB
-        return int(value.strip('K')) / 1024
-    elif value.endswith("M"):
-        # It's already in MB
-        return int(value.strip('M'))
-    elif value.endswith("G"):
-        # Convert GB to MB
-        return int(value.strip('G')) * 1024
-    else:
-        return 0  # If the value is not recognized
-
-# Filter cPanel Accounts
-def cpanel_accounts_filter(cpanel_accounts_list):
-    try:
-        # Verify cpanel_accounts_list variable - check if 'data' and 'acct' keys exist
-        if not cpanel_accounts_list or "data" not in cpanel_accounts_list or "acct" not in cpanel_accounts_list["data"]:
-            raise ValueError("Invalid response structure: 'data' or 'acct' keys are missing.")
-        
-    # Handle Exceptions
-    except Exception as e:
-        print(f"Error fetching or processing accounts: {e}")
-        return 0
-    
-    try:
-        if cpanel_backup_accounts[0] != 'all':
-        #if cpanel_backup_accounts[0].lower() != 'all':
-            # Initalize a Empty Variable to Populate with Filtered Users
-            cpanel_users_filtered = []
-            
-            for account in cpanel_accounts_list["data"]["acct"]:
-                for cpanel_user in cpanel_backup_accounts:
-                    if account["user"] == cpanel_user:
-                    #if account["user"].lower() == cpanel_user.lower():
-                        cpanel_users_filtered.append(account)
-        else:
-            cpanel_users_filtered = cpanel_accounts_list
-        return cpanel_users_filtered
-    # Handle Exceptions
-    except KeyError as e:
-        print(f"Skipping account due to missing 'diskused' field: {e}")
-
-# Add cPanel users disk usage together to estimate uncompressed backup size
-def cpanel_account_size_estimate_mb(filtered_cpanel_accounts):
-    try:
-        # Initalize cPanel Accounts Total Size Variable
-        cpanel_uncompressed_size_mb = {}
-        cpanel_uncompressed_size_mb["total"] = 0
-        cpanel_uncompressed_size_mb["biggest"] = {}
-        cpanel_uncompressed_size_mb["biggest"]["user"] = ""
-        cpanel_uncompressed_size_mb["biggest"]["sizemb"] = 0
-        
-        # Loop cPanel Accounts
-        for account in filtered_cpanel_accounts["data"]["acct"]:
-            try:
-                # Make sure 'diskused' is valid
-                if "diskused" not in account:
-                    raise KeyError(f"Account {account} 'diskused' field is empty")
-                    
-                # Convert 'diskused' to Megabytes
-                disk_used_mb = convert_to_mb(account["diskused"])
-                
-                # Add to cPanel total size
-                cpanel_uncompressed_size_mb["total"] += disk_used_mb
-                
-                # Compare individual user size, only keep the largest
-                if disk_used_mb > cpanel_uncompressed_size_mb["biggest"]["sizemb"]:
-                    cpanel_uncompressed_size_mb["biggest"]["user"] = account["user"]
-                    cpanel_uncompressed_size_mb["biggest"]["sizemb"] = disk_used_mb
-                
-            # Handle Exceptions
-            except KeyError as e:
-                print(f"Skipping account due to missing 'diskused' field: {e}")
-            except ValueError as e:
-                print(f"Skipping account due to invalid diskused value: {e}")
-            except Exception as e:
-                print(f"Unexpected error while processing account {account}: {e}")
-       
-        # Return Results
-        return cpanel_uncompressed_size_mb
-        
-    # Handle Exceptions
-    except KeyError as e:
-        print(f"Skipping due to missing 'diskused' field: {e}")
-
-# Get Free Space (Local Disk)
-class DirectoryPathError(Exception):
-    def __init__(self, message="Provided directory is not accessible"):
-        self.message = message
-        super().__init__(self.message)
-
-def get_free_space_local_disk(directory_path):
-    try:
-        # Make sure directory_path exists
-        if os.path.isdir(directory_path):
-            
-            # Get free space and store in variable free_space
-            free_space = {}
-            free_space["total"], free_space["used"],free_space["free"] = shutil.disk_usage(directory_path)
-            
-            free_space["total"] = free_space["total"] //(1024**2)
-            free_space["used"] = free_space["used"] //(1024**2)
-            free_space["free"] = free_space["free"] //(1024**2)
-            
-            # Return Results
-            return free_space
-        else:
-            raise DirectoryPathError(f"{directory_path}")
-            
-    # Handle Exceptions
-    except DirectoryPathError as e:
-        print(f"Error: Provided directory is not accessible: {e}")
+# Retrieve List of all cPanel Accounts
+all_cpanel_accounts = functions.CpanelListAllAccounts()
+print("###################### All cPanel Accounts ######################")
+print(all_cpanel_accounts)
 
 # Get cPanel Account Data and Filter for selected Accounts
-filtered_cpanel_accounts = cpanel_accounts_filter(cpanel_list_all_accounts())
-#print(filtered_cpanel_accounts)
+filtered_cpanel_accounts = functions.CpanelAccountsFilter(all_cpanel_accounts, cpanel_backup_accounts)
+print("###################### cPanel Filtered Accounts ######################")
+print(filtered_cpanel_accounts)
+
+####################################################################################################################################################
+########################################################### Process Storage Requirements ###########################################################
+####################################################################################################################################################
 
 # Get cPanel account size estimate
-cpanel_account_size_esitmate = cpanel_account_size_estimate_mb(filtered_cpanel_accounts)
+#cpanel_account_size_esitmate = functions.CpanelAccountSizeEstimateMB(filtered_cpanel_accounts)
+#print("###################### cPanel Account Size Estimate ######################")
 #print(cpanel_account_size_esitmate)
 
-# Check if Working Dir has enough space to create backup file estimated size
-get_free_space_local_disk(cpanel_backup_destination)
-# for each account, compare estimated size to free space
+# Retrieve Working Dir free space
+#cpanel_free_space = functions.GetFreeSpaceLocalDisk(cpanel_backup_destination)
+#print("###################### cPanel Free Space ######################")
+#print(cpanel_free_space)
 
-# Check to see if Destination has enough free space to store backup file estimated size
+# Calcuate if cPanel backups and FTP transfer can be done simultaneously or if it needs to be done sequentially (based on free space)
+#if cpanel_account_size_esitmate["total"] > cpanel_free_space["free"]:
+#    cpanel_backup_processing = "simultaneous"
+#if cpanel_account_size_esitmate["biggest"]["sizemb"] > cpanel_free_space["free"]:
+#    cpanel_backup_processing = "sequential"
+#print(cpanel_backup_processing)
+
+####################################################################################################################################################
+############################################################## Backup cPanel Accounts ##############################################################
+####################################################################################################################################################
 
 # for each account backup, check for backup errors, apply retention, transfer to destination, confirm successful transfer, clean up working dir
+for cpanel_account in filtered_cpanel_accounts["data"]["acct"]:
+
+    #Estimate cPanel Account Disk Space Requirements
+    cpanel_backup_workingdir_free_space_buffer_mb = 1024 #This is how much free space ontop of the cpanel estimated size you require, for the backup to run
+    cpanel_backup_required_space_mb = ((functions.ConvertToMB(cpanel_account["diskused"]) * 2) + cpanel_backup_workingdir_free_space_buffer_mb) 
+
+    #Check if Working Directory has enough free space to fit this cPanel Account's estimated size
+    if cpanel_backup_required_space_mb > (functions.GetFreeSpaceLocalDisk(cpanel_backup_working_directory))["free"]:
+        #cpanel_account_backup_result["result"] = "Not enough free space on ()"#error and exit
+        cpanel_backup_result = {}
+        cpanel_backup_result["account"] = cpanel_account['user']
+        cpanel_backup_result["est_size_mb"] = cpanel_account['diskused']
+        cpanel_backup_result["required_free_mb"] = cpanel_backup_required_space_mb
+        cpanel_backup_result["working_directory_free_mb"] = (functions.GetFreeSpaceLocalDisk(cpanel_backup_working_directory))['free']
+        cpanel_backup_result["result"] = "failed"
+        cpanel_backup_result["info"] = f"There is not enough free space on: {cpanel_backup_working_directory} for cPanel Account: {cpanel_account['user']}"
+        
+        #print(f"\033[31mThere is not enough free space on {cpanel_backup_working_directory} for cPanel Account: {cpanel_account['user']}\033[0m")
+        #print(f"\tRequired Free Space(MB): {cpanel_backup_required_space}")
+        #print(f"\tWorking Directory Free Space(MB): {(functions.GetFreeSpaceLocalDisk(cpanel_backup_working_directory))['free']}")
+        #print(f"\tAdditional Free Space Required(MB): {((cpanel_backup_required_space) - (functions.GetFreeSpaceLocalDisk(cpanel_backup_working_directory))['free'])}")
+    else:
+        print(f"There is enough free space on {cpanel_backup_working_directory} for cPanel Account: {cpanel_account['user']}")
+        print(f"\tRequired Free Space(MB): {cpanel_backup_required_space_mb}")
+        print(f"\tWorking Directory Free Space(MB): {(functions.GetFreeSpaceLocalDisk(cpanel_backup_working_directory))['free']}")
+
+        #backup account to workingdir
+        #####/usr/local/cpanel/scripts/pkgacct eatingsecretscom /home/backuptest
+        #apply retention for that accounts backups
+        #####Will need to ftp, list backups matching user, make sure there are at least as many as there should be, if there are identify and delete the oldest
+        #transfer to ftp destination
+        #####Will need to ftp, copy file
+        #confirm successful transfer
+        #####Will need to ftp, and somehow verify file.... might be as little as confirming the file is there
+        #clean up workingdir
+        #####Delete files in the cpanel_backup_working_directory related to cpanel_account['user']
+        #log results to report
+        #####Report User, Uncompressed Size, Compressed Size, 
